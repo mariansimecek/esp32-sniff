@@ -135,8 +135,8 @@ void scd41_reader_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     if (scd41_read_measurement(&co2_val, &temp_val, &humi_val) == ESP_OK) {
-      printf("CO2: %d ppm, Temp: %.2f C, Hum: %.2f %%RH\n", co2_val, temp_val,
-             humi_val);
+      printf(" SCD41 - Temp: %.2f C, Hum: %.2f %%RH, CO2: %d ppm\n", temp_val,
+             humi_val, co2_val);
     }
   }
 }
@@ -271,9 +271,9 @@ void bme280_reader_task(void *pvParameters) {
       rslt = bme280_get_sensor_data(BME280_ALL, &comp_data, dev);
       if (rslt == BME280_OK) {
         // The BME280 driver returns pressure in Pa. Convert to hPa (mbar).
-        printf("BME280 - Temp: %.2f C, Pres: %.2f hPa, Hum: %.2f %%RH\n",
-               comp_data.temperature, comp_data.pressure / 100.0,
-               comp_data.humidity);
+        printf("BME280 - Temp: %.2f C, Hum: %.2f %%RH, Pres: %.2f hPa, \n",
+               comp_data.temperature, comp_data.humidity,
+               comp_data.pressure / 100.0);
       } else {
         ESP_LOGE(TAG_BME280, "Failed to read sensor data: %d", rslt);
         bme280_error_codes_print_result(rslt);
