@@ -1,5 +1,6 @@
 #include "bme280.h"
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include <freertos/FreeRTOS.h>
@@ -8,12 +9,26 @@
 
 static const char *TAG_BME280 = "BME280";
 static const char *SCD41_TAG = "SCD41";
+static const char *TAG_PMS = "PMS5003";
+
+typedef struct {
+  uint16_t pm1_0;
+  uint16_t pm2_5;
+  uint16_t pm10;
+} pms5003_data_t;
 
 // I2C pin configuration (ESP32-C3)
 #define I2C_MASTER_SCL_IO 9
 #define I2C_MASTER_SDA_IO 8
 #define I2C_MASTER_PORT I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 100000
+
+#define PMS5003_UART_PORT UART_NUM_1
+#define PMS5003_UART_RX 20
+#define PMS5003_UART_TX 21
+#define PMS5003_UART_BAUD 9600
+#define PMS5003_BUF_SIZE 128
+#define PMS5003_FRAME_LEN 34
 
 // SCD41 sensor address and commands
 #define SCD41_SENSOR_ADDR 0x62
@@ -281,9 +296,10 @@ void bme280_reader_task(void *pvParameters) {
     }
 
     // Read every 10 seconds (adjust as needed)
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
+
 static void i2c_scan(void) {
   ESP_LOGI("I2C_SCAN", "Scanning I2C bus...");
 
@@ -309,56 +325,145 @@ static void i2c_scan(void) {
   ESP_LOGI("I2C_SCAN", "Scan complete.");
 }
 
+static bool pms5003_validate(uint8_t *buf) {
+  ESP_LOGI("PMS5003", "Validating PMS5003 data");
+  uint16_t sum = 0;
+  for (int i = 0; i < 30; i++)
+    sum += buf[i];
+  uint16_t recv_sum = (buf[30] << 8) | buf[31];
+  bool res = sum == recv_sum;
+  ESP_LOGI("PMS5003", "Checksum %s", res ? "valid" : "invalid");
+  return res;
+}
+
+// static void pms5003_task(void *pvParameters) {
+//   ESP_LOGI("PMS5003", "Starting PMS5003 task");
+//   uint8_t buf[PMS5003_BUF_SIZE];
+//   pms5003_data_t data;
+
+//   while (1) {
+//     ESP_LOGI("PMS5003", "Reading PMS5003 data");
+//     int len = uart_read_bytes(PMS5003_UART_PORT, buf, PMS5003_FRAME_LEN,
+//     pdMS_TO_TICKS(1000)); ESP_LOGI("PMS5003", "Received %d bytes", len); if
+//     (len == PMS5003_FRAME_LEN && buf[0] == 0x42 && buf[1] == 0x4d) { // frame
+//     header
+//       if (pms5003_validate(buf)) {
+//         data.pm1_0 = (buf[10] << 8) | buf[11];
+//         data.pm2_5 = (buf[12] << 8) | buf[13];
+//         data.pm10 = (buf[14] << 8) | buf[15];
+//         ESP_LOGI(TAG_PMS, "PM1.0: %d, PM2.5: %d, PM10: %d", data.pm1_0,
+//                  data.pm2_5, data.pm10);
+//       } else {
+//         ESP_LOGW(TAG_PMS, "Checksum invalid");
+//       }
+//     }
+//     vTaskDelay(pdMS_TO_TICKS(1000)); // 1s read interval
+//   }
+// }
+static void pms5003_task(void *pvParameters) {
+  uint8_t byte;
+  uint8_t frame_buf[PMS5003_FRAME_LEN];
+  size_t idx = 0;
+  pms5003_data_t data;
+
+  ESP_LOGI(TAG_PMS, "Starting PMS5003 task");
+
+  while (1) {
+    int r = uart_read_bytes(PMS5003_UART_PORT, &byte, 1, pdMS_TO_TICKS(200));
+    if (r <= 0)
+      continue;
+
+    // Shift bytes to maintain a sliding window
+    if (idx < PMS5003_FRAME_LEN) {
+      frame_buf[idx++] = byte;
+    } else {
+      memmove(frame_buf, frame_buf + 1, PMS5003_FRAME_LEN - 1);
+      frame_buf[PMS5003_FRAME_LEN - 1] = byte;
+    }
+
+    // Check header
+    if (frame_buf[0] == 0x42 && frame_buf[1] == 0x4D &&
+        idx == PMS5003_FRAME_LEN) {
+      if (pms5003_validate(frame_buf)) {
+        data.pm1_0 = (frame_buf[10] << 8) | frame_buf[11];
+        data.pm2_5 = (frame_buf[12] << 8) | frame_buf[13];
+        data.pm10 = (frame_buf[14] << 8) | frame_buf[15];
+        ESP_LOGI(TAG_PMS, "PM1.0: %d, PM2.5: %d, PM10: %d", data.pm1_0, data.pm2_5,
+                 data.pm10);
+      } else {
+        ESP_LOGW(TAG_PMS, "Checksum invalid");
+      }
+      // Reset index to start searching for next frame
+      idx = 0;
+    }
+  }
+}
+
 static struct bme280_dev dev;
 
 void app_main(void) {
-  i2c_master_init();
-  // i2c_scan();
-  // return;
+  // i2c_master_init();
 
-  if (scd41_init() == ESP_OK) {
-    xTaskCreate(scd41_reader_task, "scd41_reader", configMINIMAL_STACK_SIZE * 4,
-                NULL, 5, NULL);
-  }
-  int8_t res;
-  dev.intf_ptr = bme280_dev_handle;
-  dev.intf =
-      BME280_I2C_INTF; // BME280_I2C_INTF is typically defined in bme280.h
-  dev.read = bme280_i2c_read;
-  dev.write = bme280_i2c_write;
-  dev.delay_us = bme280_delay_us;
-  struct bme280_settings settings;
+  // if (scd41_init() == ESP_OK) {
+  //   xTaskCreate(scd41_reader_task, "scd41_reader", configMINIMAL_STACK_SIZE *
+  //   4,
+  //               NULL, 5, NULL);
+  // }
+  // int8_t res;
+  // dev.intf_ptr = bme280_dev_handle;
+  // dev.intf =
+  //     BME280_I2C_INTF; // BME280_I2C_INTF is typically defined in bme280.h
+  // dev.read = bme280_i2c_read;
+  // dev.write = bme280_i2c_write;
+  // dev.delay_us = bme280_delay_us;
+  // struct bme280_settings settings;
 
-  res = bme280_init(&dev);
-  bme280_error_codes_print_result(res);
-  if (res < 0) {
-    return;
-  }
+  // res = bme280_init(&dev);
+  // bme280_error_codes_print_result(res);
+  // if (res < 0) {
+  //   return;
+  // }
 
-  res = bme280_get_sensor_settings(&settings, &dev);
-  bme280_error_codes_print_result(res);
-  if (res < 0) {
-    return;
-  }
-  if (res == BME280_OK) {
-    ESP_LOGI(TAG_BME280, "BME280 Initialized successfully.");
+  // res = bme280_get_sensor_settings(&settings, &dev);
+  // bme280_error_codes_print_result(res);
+  // if (res < 0) {
+  //   return;
+  // }
+  // if (res == BME280_OK) {
+  //   ESP_LOGI(TAG_BME280, "BME280 Initialized successfully.");
 
-    // Set up BME280 sensor settings for Forced Mode (for simple periodic
-    // reading)
-    settings.osr_h = BME280_OVERSAMPLING_1X;
-    settings.osr_p = BME280_OVERSAMPLING_4X;
-    settings.osr_t = BME280_OVERSAMPLING_2X;
-    settings.filter = BME280_FILTER_COEFF_16;
+  //   // Set up BME280 sensor settings for Forced Mode (for simple periodic
+  //   // reading)
+  //   settings.osr_h = BME280_OVERSAMPLING_1X;
+  //   settings.osr_p = BME280_OVERSAMPLING_4X;
+  //   settings.osr_t = BME280_OVERSAMPLING_2X;
+  //   settings.filter = BME280_FILTER_COEFF_16;
 
-    uint8_t rslt =
-        bme280_set_sensor_settings(BME280_SEL_OSR_PRESS | BME280_SEL_OSR_TEMP |
-                                       BME280_SEL_OSR_HUM | BME280_SEL_FILTER,
-                                   &settings, &dev);
-    bme280_error_codes_print_result(rslt);
+  //   uint8_t rslt =
+  //       bme280_set_sensor_settings(BME280_SEL_OSR_PRESS | BME280_SEL_OSR_TEMP
+  //       |
+  //                                      BME280_SEL_OSR_HUM |
+  //                                      BME280_SEL_FILTER,
+  //                                  &settings, &dev);
+  //   bme280_error_codes_print_result(rslt);
 
-    if (rslt == BME280_OK) {
-      xTaskCreate(bme280_reader_task, "bme280_reader",
-                  configMINIMAL_STACK_SIZE * 4, &dev, 5, NULL);
-    }
-  }
+  //   if (rslt == BME280_OK) {
+  //     xTaskCreate(bme280_reader_task, "bme280_reader",
+  //                 configMINIMAL_STACK_SIZE * 4, &dev, 5, NULL);
+  //   }
+  // }
+
+  uart_config_t uart_config = {.baud_rate = PMS5003_UART_BAUD,
+                               .data_bits = UART_DATA_8_BITS,
+                               .parity = UART_PARITY_DISABLE,
+                               .stop_bits = UART_STOP_BITS_1,
+                               .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
+  ESP_ERROR_CHECK(uart_param_config(PMS5003_UART_PORT, &uart_config));
+  ESP_ERROR_CHECK(uart_set_pin(PMS5003_UART_PORT, PMS5003_UART_TX,
+                               PMS5003_UART_RX, UART_PIN_NO_CHANGE,
+                               UART_PIN_NO_CHANGE));
+  ESP_ERROR_CHECK(uart_driver_install(PMS5003_UART_PORT, PMS5003_BUF_SIZE * 2,
+                                      0, 0, NULL, 0));
+
+  xTaskCreate(pms5003_task, "pms5003_task", 4096, NULL, 5, NULL);
 }
