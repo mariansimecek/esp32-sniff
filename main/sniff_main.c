@@ -3,6 +3,9 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "mqtt_client.h"
+#include "nvs_flash.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stdio.h>
@@ -150,7 +153,7 @@ void scd41_reader_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     if (scd41_read_measurement(&co2_val, &temp_val, &humi_val) == ESP_OK) {
-      printf(" SCD41 - Temp: %.2f C, Hum: %.2f %%RH, CO2: %d ppm\n", temp_val,
+      printf("  SCD41 - Temp: %.2f C, Hum: %.2f %%RH, CO2: %d ppm\n", temp_val,
              humi_val, co2_val);
     }
   }
@@ -286,7 +289,7 @@ void bme280_reader_task(void *pvParameters) {
       rslt = bme280_get_sensor_data(BME280_ALL, &comp_data, dev);
       if (rslt == BME280_OK) {
         // The BME280 driver returns pressure in Pa. Convert to hPa (mbar).
-        printf("BME280 - Temp: %.2f C, Hum: %.2f %%RH, Pres: %.2f hPa, \n",
+        printf(" BME280 - Temp: %.2f C, Hum: %.2f %%RH, Pres: %.2f hPa\n",
                comp_data.temperature, comp_data.humidity,
                comp_data.pressure / 100.0);
       } else {
@@ -326,13 +329,11 @@ static void i2c_scan(void) {
 }
 
 static bool pms5003_validate(uint8_t *buf) {
-  ESP_LOGI("PMS5003", "Validating PMS5003 data");
   uint16_t sum = 0;
   for (int i = 0; i < 30; i++)
     sum += buf[i];
   uint16_t recv_sum = (buf[30] << 8) | buf[31];
   bool res = sum == recv_sum;
-  ESP_LOGI("PMS5003", "Checksum %s", res ? "valid" : "invalid");
   return res;
 }
 
@@ -388,8 +389,8 @@ static void pms5003_task(void *pvParameters) {
         data.pm1_0 = (frame_buf[10] << 8) | frame_buf[11];
         data.pm2_5 = (frame_buf[12] << 8) | frame_buf[13];
         data.pm10 = (frame_buf[14] << 8) | frame_buf[15];
-        ESP_LOGI(TAG_PMS, "PM1.0: %d, PM2.5: %d, PM10: %d", data.pm1_0, data.pm2_5,
-                 data.pm10);
+        printf("PMS5003 - PM1.0: %d, PM2.5: %d, PM10: %d \n", data.pm1_0,
+               data.pm2_5, data.pm10);
       } else {
         ESP_LOGW(TAG_PMS, "Checksum invalid");
       }
@@ -398,60 +399,101 @@ static void pms5003_task(void *pvParameters) {
     }
   }
 }
+static void mqtt_event_handler_cb(void *handler_args, esp_event_base_t base,
+                                  int32_t event_id, void *event_data) {
+  ESP_LOGD("MQTT", "Event dispatched from event loop base=%s, event_id=%d",
+           base, event_id);
+  esp_mqtt_event_handle_t event = event_data;
+  esp_mqtt_client_handle_t client = event->client;
+  switch (event->event_id) {
+  case MQTT_EVENT_CONNECTED:
+    ESP_LOGI("MQTT", "MQTT connected");
+    // Send a test message to Home Assistant
+    esp_mqtt_client_publish(client, "homeassistant/sensor/esp32/state", "23.5",
+                            0, 1, 0);
+    break;
+  case MQTT_EVENT_DISCONNECTED:
+    ESP_LOGI("MQTT", "MQTT disconnected");
+    break;
+  case MQTT_EVENT_SUBSCRIBED:
+    ESP_LOGI("MQTT", "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+    break;
+  case MQTT_EVENT_UNSUBSCRIBED:
+    ESP_LOGI("MQTT", "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+    break;
+  case MQTT_EVENT_PUBLISHED:
+    ESP_LOGI("MQTT", "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+    break;
+  case MQTT_EVENT_DATA:
+    ESP_LOGI("MQTT", "MQTT_EVENT_DATA");
+    break;
+  case MQTT_EVENT_ERROR:
+    ESP_LOGI("MQTT", "MQTT_EVENT_ERROR");
+    break;
+  default:
+    ESP_LOGI("MQTT", "Other event id:%d", event->event_id);
+    break;
+  }
+}
 
+void mqtt_app_start(void) {
+  esp_mqtt_client_config_t mqtt_cfg = {
+      .broker = {.address =
+                     {
+                         .uri = "mqtt://192.168.0.31:1883" // full broker URI
+                     }},
+      // .credentials = {
+      //     .username = "your_user",
+      //     .authentication = {
+      //         .password = "your_pass"
+      //     }
+      // }
+  };
+
+  esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+  esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID,
+                                 mqtt_event_handler_cb, NULL);
+  esp_mqtt_client_start(client);
+  ESP_LOGI("MQTT_INIT", "MQTT initialization complete");
+}
 static struct bme280_dev dev;
 
 void app_main(void) {
-  // i2c_master_init();
+  nvs_flash_init();                // Setup persistent storage
+  esp_netif_init();                // Setup network stack
+  esp_event_loop_create_default(); // Setup event handling
 
-  // if (scd41_init() == ESP_OK) {
-  //   xTaskCreate(scd41_reader_task, "scd41_reader", configMINIMAL_STACK_SIZE *
-  //   4,
-  //               NULL, 5, NULL);
-  // }
-  // int8_t res;
-  // dev.intf_ptr = bme280_dev_handle;
-  // dev.intf =
-  //     BME280_I2C_INTF; // BME280_I2C_INTF is typically defined in bme280.h
-  // dev.read = bme280_i2c_read;
-  // dev.write = bme280_i2c_write;
-  // dev.delay_us = bme280_delay_us;
-  // struct bme280_settings settings;
+  wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
 
-  // res = bme280_init(&dev);
-  // bme280_error_codes_print_result(res);
-  // if (res < 0) {
-  //   return;
-  // }
+  esp_wifi_init(&wifi_cfg); // Your Wi-Fi init function
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  // 5. Configure Wi-Fi credentials
+  wifi_config_t wifi_config = {
+      .sta =
+          {
+              .ssid = "WajFaj",
+              .password = "QvdUUh6G4lV5a5l5ua",
+              .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+              .pmf_cfg = {.capable = true, .required = false},
+          },
+  };
+  esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+  esp_wifi_start();
 
-  // res = bme280_get_sensor_settings(&settings, &dev);
-  // bme280_error_codes_print_result(res);
-  // if (res < 0) {
-  //   return;
-  // }
-  // if (res == BME280_OK) {
-  //   ESP_LOGI(TAG_BME280, "BME280 Initialized successfully.");
+  ESP_LOGI("WIFI_INIT", "Wi-Fi initialization complete");
 
-  //   // Set up BME280 sensor settings for Forced Mode (for simple periodic
-  //   // reading)
-  //   settings.osr_h = BME280_OVERSAMPLING_1X;
-  //   settings.osr_p = BME280_OVERSAMPLING_4X;
-  //   settings.osr_t = BME280_OVERSAMPLING_2X;
-  //   settings.filter = BME280_FILTER_COEFF_16;
+  esp_netif_ip_info_t ip;
+  esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
+  ESP_LOGI("WIFI", "IP: " IPSTR, IP2STR(&ip.ip));
 
-  //   uint8_t rslt =
-  //       bme280_set_sensor_settings(BME280_SEL_OSR_PRESS | BME280_SEL_OSR_TEMP
-  //       |
-  //                                      BME280_SEL_OSR_HUM |
-  //                                      BME280_SEL_FILTER,
-  //                                  &settings, &dev);
-  //   bme280_error_codes_print_result(rslt);
+  mqtt_app_start();
 
-  //   if (rslt == BME280_OK) {
-  //     xTaskCreate(bme280_reader_task, "bme280_reader",
-  //                 configMINIMAL_STACK_SIZE * 4, &dev, 5, NULL);
-  //   }
-  // }
+  // Start MQTT broker
+  // mqtt_broker_config_t broker_cfg = {
+  //     .port = 1883, .max_clients = 4, .client_buffer_size = 256};
+  // broker = mqtt_broker_init(&broker_cfg);
+  // mqtt_broker_start(broker);
+  // ESP_LOGI(TAG, "MQTT broker started on port 1883");
 
   uart_config_t uart_config = {.baud_rate = PMS5003_UART_BAUD,
                                .data_bits = UART_DATA_8_BITS,
@@ -466,4 +508,51 @@ void app_main(void) {
                                       0, 0, NULL, 0));
 
   xTaskCreate(pms5003_task, "pms5003_task", 4096, NULL, 5, NULL);
+  i2c_master_init();
+
+  if (scd41_init() == ESP_OK) {
+    xTaskCreate(scd41_reader_task, "scd41_reader", configMINIMAL_STACK_SIZE * 4,
+                NULL, 5, NULL);
+  }
+  int8_t res;
+  dev.intf_ptr = bme280_dev_handle;
+  dev.intf =
+      BME280_I2C_INTF; // BME280_I2C_INTF is typically defined in bme280.h
+  dev.read = bme280_i2c_read;
+  dev.write = bme280_i2c_write;
+  dev.delay_us = bme280_delay_us;
+  struct bme280_settings settings;
+
+  res = bme280_init(&dev);
+  bme280_error_codes_print_result(res);
+  if (res < 0) {
+    return;
+  }
+
+  res = bme280_get_sensor_settings(&settings, &dev);
+  bme280_error_codes_print_result(res);
+  if (res < 0) {
+    return;
+  }
+  if (res == BME280_OK) {
+    ESP_LOGI(TAG_BME280, "BME280 Initialized successfully.");
+
+    // Set up BME280 sensor settings for Forced Mode (for simple periodic
+    // reading)
+    settings.osr_h = BME280_OVERSAMPLING_1X;
+    settings.osr_p = BME280_OVERSAMPLING_4X;
+    settings.osr_t = BME280_OVERSAMPLING_2X;
+    settings.filter = BME280_FILTER_COEFF_16;
+
+    uint8_t rslt =
+        bme280_set_sensor_settings(BME280_SEL_OSR_PRESS | BME280_SEL_OSR_TEMP |
+                                       BME280_SEL_OSR_HUM | BME280_SEL_FILTER,
+                                   &settings, &dev);
+    bme280_error_codes_print_result(rslt);
+
+    if (rslt == BME280_OK) {
+      xTaskCreate(bme280_reader_task, "bme280_reader",
+                  configMINIMAL_STACK_SIZE * 4, &dev, 5, NULL);
+    }
+  }
 }
