@@ -1,9 +1,11 @@
 #include "bme280.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_wifi_types_generic.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include <freertos/FreeRTOS.h>
@@ -21,8 +23,8 @@ typedef struct {
 } pms5003_data_t;
 
 // I2C pin configuration (ESP32-C3)
-#define I2C_MASTER_SCL_IO 9
-#define I2C_MASTER_SDA_IO 8
+#define I2C_MASTER_SCL_IO 6
+#define I2C_MASTER_SDA_IO 7
 #define I2C_MASTER_PORT I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 100000
 
@@ -437,6 +439,7 @@ static void mqtt_event_handler_cb(void *handler_args, esp_event_base_t base,
 }
 
 void mqtt_app_start(void) {
+  ESP_LOGI("MQTT_INIT", "MQTT initialization started");
   esp_mqtt_client_config_t mqtt_cfg = {
       .broker = {.address =
                      {
@@ -456,37 +459,166 @@ void mqtt_app_start(void) {
   esp_mqtt_client_start(client);
   ESP_LOGI("MQTT_INIT", "MQTT initialization complete");
 }
+/* Event handler for Wi-Fi / IP events */
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    ESP_LOGI("WIFI", "WIFI started -> connecting");
+    esp_wifi_connect();
+  } else if (event_base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    wifi_event_sta_disconnected_t *dis =
+        (wifi_event_sta_disconnected_t *)event_data;
+    ESP_LOGW("WIFI", "Disconnected, reason %d - reconnecting...",
+             dis ? dis->reason : -1);
+    esp_wifi_connect();
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t *ip_info = (ip_event_got_ip_t *)event_data;
+    ESP_LOGI("WIFI", "Got IP: " IPSTR, IP2STR(&ip_info->ip_info.ip));
+    /* If you need full ip_info struct later, you can copy/store it here. */
+  }
+}
+
+#define BLINK_GPIO 8 // Replace with your LED pin
+void blink_led_task(void *pvParameter) {
+  while (1) {
+    gpio_set_level(BLINK_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    gpio_set_level(BLINK_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+/* FreeRTOS event group to signal when we are connected*/
+static EventGroupHandle_t s_wifi_event_group;
+
+/* The event group allows multiple bits for each event, but we only care about
+ * two events:
+ * - we are connected to the AP with an IP
+ * - we failed to connect after the maximum amount of retries */
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+#define WIFI_MAXIMUM_RETRY 10
+#define WIFI_SSID "WajFaj"
+#define WIFI_PASSWORD "QvdUUh6G4lV5a5l5ua"
+
+static const char *TAG = "wifi station";
+
+static int s_retry_num = 0;
 static struct bme280_dev dev;
 
-void app_main(void) {
-  nvs_flash_init();                // Setup persistent storage
-  esp_netif_init();                // Setup network stack
-  esp_event_loop_create_default(); // Setup event handling
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data) {
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    esp_wifi_connect();
+  } else if (event_base == WIFI_EVENT &&
+             event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (s_retry_num < WIFI_MAXIMUM_RETRY) {
+      esp_wifi_connect();
+      s_retry_num++;
+      ESP_LOGI(TAG, "retry to connect to the AP");
+    } else {
+      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+    }
+    ESP_LOGI(TAG, "connect to the AP fail");
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+    s_retry_num = 0;
+    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+  }
+}
+void wifi_init_sta(void) {
+  s_wifi_event_group = xEventGroupCreate();
 
-  wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_netif_init());
 
-  esp_wifi_init(&wifi_cfg); // Your Wi-Fi init function
-  esp_wifi_set_mode(WIFI_MODE_STA);
-  // 5. Configure Wi-Fi credentials
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+  esp_event_handler_instance_t instance_any_id;
+  esp_event_handler_instance_t instance_got_ip;
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
+
   wifi_config_t wifi_config = {
       .sta =
           {
-              .ssid = "WajFaj",
-              .password = "QvdUUh6G4lV5a5l5ua",
-              .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-              .pmf_cfg = {.capable = true, .required = false},
+              .ssid = WIFI_SSID,
+              .password = WIFI_PASSWORD,
+              // .scan_method = WIFI_ALL_CHANNEL_SCAN,
+              .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
+              .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+              .sae_h2e_identifier = "",
           },
   };
-  esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
-  esp_wifi_start();
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_start());
 
-  ESP_LOGI("WIFI_INIT", "Wi-Fi initialization complete");
+  ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-  esp_netif_ip_info_t ip;
-  esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip);
-  ESP_LOGI("WIFI", "IP: " IPSTR, IP2STR(&ip.ip));
+  /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or
+   * connection failed for the maximum number of re-tries (WIFI_FAIL_BIT). The
+   * bits are set by event_handler() (see above) */
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                         pdFALSE, pdFALSE, portMAX_DELAY);
 
-  mqtt_app_start();
+  /* xEventGroupWaitBits() returns the bits before the call returned, hence we
+   * can test which event actually happened. */
+  if (bits & WIFI_CONNECTED_BIT) {
+    ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", WIFI_SSID,
+             WIFI_PASSWORD);
+  } else if (bits & WIFI_FAIL_BIT) {
+    ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s", WIFI_SSID,
+             WIFI_PASSWORD);
+  } else {
+    ESP_LOGE(TAG, "UNEXPECTED EVENT");
+  }
+}
+void app_main(void) {
+  // Initialize NVS
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
+
+  if (CONFIG_LOG_MAXIMUM_LEVEL > CONFIG_LOG_DEFAULT_LEVEL) {
+    /* If you only want to open more logs in the wifi module, you need to make
+     * the max level greater than the default level, and call
+     * esp_log_level_set() before esp_wifi_init() to improve the log level of
+     * the wifi module. */
+    esp_log_level_set("wifi", CONFIG_LOG_MAXIMUM_LEVEL);
+  }
+
+  ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+  wifi_init_sta();
+  // Check if Wi-Fi is connected
+  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                         pdFALSE, pdFALSE, 0);
+  gpio_reset_pin(BLINK_GPIO);
+  gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+
+  if (bits & WIFI_CONNECTED_BIT) {
+    ESP_LOGI(TAG, "Starting LED blink task");
+    gpio_set_level(BLINK_GPIO, 0);
+
+  } else {
+    ESP_LOGW(TAG, "Wi-Fi not connected, LED will not blink");
+    xTaskCreate(blink_led_task, "blink_led_task", 1024, NULL, 5, NULL);
+  }
+
+  // mqtt_app_start();
 
   // Start MQTT broker
   // mqtt_broker_config_t broker_cfg = {
@@ -495,64 +627,68 @@ void app_main(void) {
   // mqtt_broker_start(broker);
   // ESP_LOGI(TAG, "MQTT broker started on port 1883");
 
-  uart_config_t uart_config = {.baud_rate = PMS5003_UART_BAUD,
-                               .data_bits = UART_DATA_8_BITS,
-                               .parity = UART_PARITY_DISABLE,
-                               .stop_bits = UART_STOP_BITS_1,
-                               .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
-  ESP_ERROR_CHECK(uart_param_config(PMS5003_UART_PORT, &uart_config));
-  ESP_ERROR_CHECK(uart_set_pin(PMS5003_UART_PORT, PMS5003_UART_TX,
-                               PMS5003_UART_RX, UART_PIN_NO_CHANGE,
-                               UART_PIN_NO_CHANGE));
-  ESP_ERROR_CHECK(uart_driver_install(PMS5003_UART_PORT, PMS5003_BUF_SIZE * 2,
-                                      0, 0, NULL, 0));
+  // uart_config_t uart_config = {.baud_rate = PMS5003_UART_BAUD,
+  //                              .data_bits = UART_DATA_8_BITS,
+  //                              .parity = UART_PARITY_DISABLE,
+  //                              .stop_bits = UART_STOP_BITS_1,
+  //                              .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
+  // ESP_ERROR_CHECK(uart_param_config(PMS5003_UART_PORT, &uart_config));
+  // ESP_ERROR_CHECK(uart_set_pin(PMS5003_UART_PORT, PMS5003_UART_TX,
+  //                              PMS5003_UART_RX, UART_PIN_NO_CHANGE,
+  //                              UART_PIN_NO_CHANGE));
+  // ESP_ERROR_CHECK(uart_driver_install(PMS5003_UART_PORT, PMS5003_BUF_SIZE *
+  // 2,
+  //                                     0, 0, NULL, 0));
 
-  xTaskCreate(pms5003_task, "pms5003_task", 4096, NULL, 5, NULL);
-  i2c_master_init();
+  // xTaskCreate(pms5003_task, "pms5003_task", 4096, NULL, 5, NULL);
+  // i2c_master_init();
 
-  if (scd41_init() == ESP_OK) {
-    xTaskCreate(scd41_reader_task, "scd41_reader", configMINIMAL_STACK_SIZE * 4,
-                NULL, 5, NULL);
-  }
-  int8_t res;
-  dev.intf_ptr = bme280_dev_handle;
-  dev.intf =
-      BME280_I2C_INTF; // BME280_I2C_INTF is typically defined in bme280.h
-  dev.read = bme280_i2c_read;
-  dev.write = bme280_i2c_write;
-  dev.delay_us = bme280_delay_us;
-  struct bme280_settings settings;
+  // if (scd41_init() == ESP_OK) {
+  //   xTaskCreate(scd41_reader_task, "scd41_reader", configMINIMAL_STACK_SIZE *
+  //   4,
+  //               NULL, 5, NULL);
+  // }
+  // int8_t res;
+  // dev.intf_ptr = bme280_dev_handle;
+  // dev.intf =
+  //     BME280_I2C_INTF; // BME280_I2C_INTF is typically defined in bme280.h
+  // dev.read = bme280_i2c_read;
+  // dev.write = bme280_i2c_write;
+  // dev.delay_us = bme280_delay_us;
+  // struct bme280_settings settings;
 
-  res = bme280_init(&dev);
-  bme280_error_codes_print_result(res);
-  if (res < 0) {
-    return;
-  }
+  // res = bme280_init(&dev);
+  // bme280_error_codes_print_result(res);
+  // if (res < 0) {
+  //   return;
+  // }
 
-  res = bme280_get_sensor_settings(&settings, &dev);
-  bme280_error_codes_print_result(res);
-  if (res < 0) {
-    return;
-  }
-  if (res == BME280_OK) {
-    ESP_LOGI(TAG_BME280, "BME280 Initialized successfully.");
+  // res = bme280_get_sensor_settings(&settings, &dev);
+  // bme280_error_codes_print_result(res);
+  // if (res < 0) {
+  //   return;
+  // }
+  // if (res == BME280_OK) {
+  //   ESP_LOGI(TAG_BME280, "BME280 Initialized successfully.");
 
-    // Set up BME280 sensor settings for Forced Mode (for simple periodic
-    // reading)
-    settings.osr_h = BME280_OVERSAMPLING_1X;
-    settings.osr_p = BME280_OVERSAMPLING_4X;
-    settings.osr_t = BME280_OVERSAMPLING_2X;
-    settings.filter = BME280_FILTER_COEFF_16;
+  //   // Set up BME280 sensor settings for Forced Mode (for simple periodic
+  //   // reading)
+  //   settings.osr_h = BME280_OVERSAMPLING_1X;
+  //   settings.osr_p = BME280_OVERSAMPLING_4X;
+  //   settings.osr_t = BME280_OVERSAMPLING_2X;
+  //   settings.filter = BME280_FILTER_COEFF_16;
 
-    uint8_t rslt =
-        bme280_set_sensor_settings(BME280_SEL_OSR_PRESS | BME280_SEL_OSR_TEMP |
-                                       BME280_SEL_OSR_HUM | BME280_SEL_FILTER,
-                                   &settings, &dev);
-    bme280_error_codes_print_result(rslt);
+  //   uint8_t rslt =
+  //       bme280_set_sensor_settings(BME280_SEL_OSR_PRESS | BME280_SEL_OSR_TEMP
+  //       |
+  //                                      BME280_SEL_OSR_HUM |
+  //                                      BME280_SEL_FILTER,
+  //                                  &settings, &dev);
+  //   bme280_error_codes_print_result(rslt);
 
-    if (rslt == BME280_OK) {
-      xTaskCreate(bme280_reader_task, "bme280_reader",
-                  configMINIMAL_STACK_SIZE * 4, &dev, 5, NULL);
-    }
-  }
+  //   if (rslt == BME280_OK) {
+  //     xTaskCreate(bme280_reader_task, "bme280_reader",
+  //                 configMINIMAL_STACK_SIZE * 4, &dev, 5, NULL);
+  //   }
+  // }
 }
